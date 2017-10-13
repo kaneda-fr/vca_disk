@@ -9,12 +9,13 @@ short_description: This is a sentence describing the module
 '''
 
 EXAMPLES = '''
-- name: Creates a new disk in a VDC
+- name: Creates a new disk in a VDC and attach it to a vm
   vca_disk:
     vapp_name: tower
     vm_name: myVM
     state=present
-    storage_profile='Tier 4'
+    operation: attach
+    storage_profile='Silver'
     vdc_name=VDC1
     username=<your username here>
     password=<your password here>
@@ -77,7 +78,7 @@ def create(module):
 
     if result[0]:
         # Waiting for disk creation to complete
-        result = module.vca.block_until_completed(result[1].Tasks[0]) 
+        result = module.vca.block_until_completed(result[1].Tasks[0])
     else:
         import xml.etree.ElementTree as ET
         root = ET.fromstring(result[1])
@@ -86,7 +87,17 @@ def create(module):
 
 def delete(module):
     vdc_name = module.params['vdc_name']
-    vapp_name = module.params['vapp_name']
+    disk_name = module.params['disk_name']
+
+    result = module.vca.delete_disk(vdc_name, disk_name)
+
+    if result[0]:
+        # Waiting for disk deletion to complete
+        result = module.vca.block_until_completed(result[1])
+    else:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(result[1])
+        module.fail("Disk deletion failed: " + root.get('message'))
 
 def do_operation(module):
     vdc_name = module.params['vdc_name']
@@ -97,13 +108,18 @@ def do_operation(module):
     bus_number = module.params['bus_number']
     unit_number = module.params['unit_number']
 
-    if operation == 'attach':
-        the_vdc = module.vca.get_vdc(vdc_name)
+
+    the_vdc = module.vca.get_vdc(vdc_name)
+    if the_vdc:
+        the_vapp = module.vca.get_vapp(the_vdc, vapp_name)
+    if the_vapp:
+        # get disk href
         link = filter(lambda link:
                       link.get_name() == disk_name,
-                      module.vca.get_diskRefs(the_vdc)) 
+                      module.vca.get_diskRefs(the_vdc))
 
-        if len(link) == 1: 
+        if len(link) == 1:
+            # get disk object
             disk = filter(lambda disk:
                           disk[0].get_name() == disk_name,
                           module.vca.get_disks(vdc_name))
@@ -111,18 +127,34 @@ def do_operation(module):
             vm = filter(lambda vm:
                         vm.get_name() == vm_name,
                         disk[0][1])
-            if len(vm) == 0:
-                the_vapp = module.vca.get_vapp(the_vdc, vapp_name)
-                if bus_number and unit_number:
-                    task = the_vapp.attach_disk_to_vm(vm_name, link[0], bus_number, unit_number)
+
+            if operation == 'attach':
+                if len(vm) == 0:
+                    if bus_number and unit_number:
+                        task = the_vapp.attach_disk_to_vm(vm_name, link[0], bus_number, unit_number)
+                    else:
+                        task = the_vapp.attach_disk_to_vm(vm_name, link[0])
+                    assert task
+                    result = module.vca.block_until_completed(task)
+                    if not result:
+                        module.fail('Disk attachement failed');
                 else:
-                    task = the_vapp.attach_disk_to_vm(vm_name, link[0]) 
-                assert task
-                result = module.vca.block_until_completed(task)
-                if not result:
-                    module.fail('Disk attachement failed');
+                    module.fail('Disk already attached');
+            elif operation == 'detach':
+                the_vapp = module.vca.get_vapp(the_vdc, vapp_name)
+                if len(vm) == 1:
+                    task = the_vapp.detach_disk_from_vm(vm_name, link[0])
+                    assert task
+                    result = module.vca.block_until_completed(task)
+                    if not result:
+                        module.fail('Disk detachement failed');
+                else:
+                    module.fail('Disk: ' + disk_name + ' not attached to vm: ' + vm_name);
         else:
-            module.fail('Disk not found');
+            module.fail('Disk: ' + disk_name + ' not found');
+    else:
+        module.fail('vApp: ' + vapp_name + ' not found in vDC: ' + vdc_name);
+
 
 def main():
 
@@ -152,37 +184,49 @@ def main():
 
     instance = get_instance(module)
 
-    if state == 'absent' and instance.get('status') != absent:
+    if state == 'absent' and instance.get('status') != 'absent':
         if not module.check_mode:
+            if instance.get('status') == 'attached':
+                if operation == 'detach':
+                    do_operation(module)
+                else:
+                    module.fail('Disk must be detached before deletion')
             delete(module)
-        result['changed'] = True
+            result['changed'] = True
+        else:
+            result['changed'] = False
 
     elif state != 'absent':
         if instance.get('status') == 'absent':
             if not module.check_mode:
                 create(module)
                 instance['status'] = 'present'
-            result['changed'] = True 
+                result['changed'] = True
+            else:
+                result['changed'] = False
 
         if DISK_OPERATION_TO_STATUS.get(operation) != instance.get('status') and operation != 'noop':
             if not module.check_mode:
-                do_operation(module) 
+                do_operation(module)
                 instance['status'] = DISK_OPERATION_TO_STATUS.get(operation)
-            result['changed'] = True
-    
+                result['changed'] = True
+            else:
+                result['changed'] = False
+
 
     if module.check_mode:
         # Check if any changes would be made but don't actually make those changes
         module.exit_json(changed=False)
 
     #module.fail(instance['state']);
-  
+
 
     vdc_name = module.params['vdc_name']
     vapp_name = module.params['vapp_name']
     vm_name = module.params['vm_name']
     disk_name = module.params['disk_name']
 
+    # retrieve and return disk details
     the_vdc = module.vca.get_vdc(vdc_name)
     the_vapp = module.vca.get_vapp(the_vdc, vapp_name)
     vms = the_vapp.me.Children.Vm
@@ -200,23 +244,25 @@ def main():
 
     _url = '{http://www.vmware.com/vcloud/v1.5}disk'
 
+
     disk_hrefs = filter(lambda disk:
                        disk.get_name() == disk_name,
                        module.vca.get_diskRefs(the_vdc))
 
-    disk = filter(lambda item: item.get_ResourceType() == 17 and
-               item.HostResource[0].get_anyAttributes_().
-               get(_url) == disk_hrefs[0].href,
-               items)
+    if len(disk_hrefs) >0:
+        disk = filter(lambda item: item.get_ResourceType() == 17 and
+                   item.HostResource[0].get_anyAttributes_().
+                   get(_url) == disk_hrefs[0].href,
+                   items)
 
-    if len(disk) == 1:
-        scsi_ctrl_id = disk[0].get_Parent().get_valueOf_()
-        scsi_ctrl = filter(lambda item: item.get_InstanceID().
-                           get_valueOf_() == scsi_ctrl_id,
-                           items)
-         
-        result['ansible_facts'] = dict(bus_number=scsi_ctrl[0].get_Address().get_valueOf_(), unit_number=disk[0].get_AddressOnParent().get_valueOf_())
-        
+        if len(disk) == 1:
+            scsi_ctrl_id = disk[0].get_Parent().get_valueOf_()
+            scsi_ctrl = filter(lambda item: item.get_InstanceID().
+                               get_valueOf_() == scsi_ctrl_id,
+                               items)
+
+            result['ansible_facts'] = dict(bus_number=scsi_ctrl[0].get_Address().get_valueOf_(), unit_number=disk[0].get_AddressOnParent().get_valueOf_())
+
         #module.fail(disk[0].get_ResourceType())
 
     #if disk.HostResource[0].get_anyAttributes_().get(_url) == disk_href:
